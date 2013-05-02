@@ -7,17 +7,22 @@
 
 module Network.NATPMP
   ( PmpProto(..)
-  , PmpUnsupp(..)
   , PmpReq(..)
-  , PmpParsedReq(..)
-  , parsePmpReq
-  , deserializePmpReq
-  , unsuppPmpReq
+  , PmpDecodedReq(..)
+  , getPmpReq
+  , sgetPmpReq
+  , encodePmpReq
+  , decodePmpReq
+  , pmpMsgData
   , PmpResult(..)
   , PmpResp(..)
-  , PmpParsedResp(..)
-  , parsePmpResp
-  , deserializePmpResp
+  , putPmpResp
+  , sputPmpResp
+  , PmpDecodedResp(..)
+  , getPmpResp
+  , sgetPmpResp
+  , encodePmpResp
+  , decodePmpResp
   ) where
 
 import Prelude hiding (print)
@@ -25,7 +30,6 @@ import Data.Typeable (Typeable)
 import GHC.Generics (Generic)
 import Data.Word (Word8, Word16, Word32)
 import Data.Bits ((.|.), (.&.))
-import Data.Monoid ((<>))
 import Data.Hashable (Hashable)
 import Data.Textual (Printable(..))
 import Data.ByteString (ByteString)
@@ -48,16 +52,6 @@ instance Printable PmpProto where
   print UDP = "UDP"
   print TCP = "TCP"
 
-data PmpUnsupp = PmpUnsuppVer
-               | PmpUnsuppOp {-# UNPACK #-} !Word8
-               deriving (Typeable, Generic, Show, Read, Eq, Ord)
-
-instance Hashable PmpUnsupp
-
-instance Printable PmpUnsupp where
-  print PmpUnsuppVer     = "Unsupported version"
-  print (PmpUnsuppOp op) = "Unsupported operation: " <> print op
-
 data PmpReq = PmpPubAddrReq
             | PmpMapReq { pmpReqProto    ∷ PmpProto
                         , pmpReqPrivPort ∷ InetPort
@@ -68,7 +62,8 @@ data PmpReq = PmpPubAddrReq
 instance Hashable PmpReq
 
 instance Binary PmpReq where
-  put PmpPubAddrReq = B.putWord8 0 >> B.putWord8 0
+  put PmpPubAddrReq =
+    B.putWord8 0 >> B.putWord8 0
   put (PmpMapReq {..}) = do
     B.putWord8 0
     B.putWord8 $ if pmpReqProto == UDP then 1 else 2
@@ -76,13 +71,15 @@ instance Binary PmpReq where
     B.put pmpReqPrivPort
     B.put pmpReqPubPort
     B.put pmpReqTtl
-  get = parsePmpReq >>= \case
-    PmpReq req     → return req
-    PmpUnsuppReq e → fail $ "NAT-PMP: " ++ print e
-    PmpNotReq      → fail $ "NAT-PMP: Not a request"
+  get = getPmpReq >>= \case
+    PmpReq req           → return req
+    PmpUnsuppVerInReq {} → fail $ "NAT-PMP: Unsupported protocol version"
+    PmpUnsuppOpInReq {}  → fail $ "NAT-PMP: Unsupported operation"
+    PmpNotReq            → fail $ "NAT-PMP: Not a request"
 
 instance Serialize PmpReq where
-  put PmpPubAddrReq = S.putWord8 0 >> S.putWord8 0
+  put PmpPubAddrReq =
+    S.putWord8 0 >> S.putWord8 0
   put (PmpMapReq {..}) = do
     S.putWord8 0
     S.putWord8 $ if pmpReqProto == UDP then 1 else 2
@@ -90,23 +87,25 @@ instance Serialize PmpReq where
     S.put pmpReqPrivPort
     S.put pmpReqPubPort
     S.put pmpReqTtl
-  get = deserializePmpReq >>= \case
-    PmpReq req     → return req
-    PmpUnsuppReq e → fail $ "NAT-PMP: " ++ print e
-    PmpNotReq      → fail $ "NAT-PMP: Not a request"
+  get = sgetPmpReq >>= \case
+    PmpReq req           → return req
+    PmpUnsuppVerInReq {} → fail $ "NAT-PMP: Unsupported protocol version"
+    PmpUnsuppOpInReq {}  → fail $ "NAT-PMP: Unsupported operation"
+    PmpNotReq            → fail $ "NAT-PMP: Not a request"
 
-data PmpParsedReq = PmpReq PmpReq
-                  | PmpUnsuppReq PmpUnsupp
-                  | PmpNotReq
-                  deriving (Typeable, Generic, Show, Read, Eq)
+data PmpDecodedReq = PmpReq PmpReq
+                   | PmpUnsuppVerInReq {-# UNPACK #-} !Word8
+                   | PmpUnsuppOpInReq {-# UNPACK #-} !Word8 ByteString
+                   | PmpNotReq
+                   deriving (Typeable, Generic, Show, Read, Eq)
 
-instance Hashable PmpParsedReq
+instance Hashable PmpDecodedReq
 
-parsePmpReq ∷ B.Get PmpParsedReq
-parsePmpReq = do
+getPmpReq ∷ B.Get PmpDecodedReq
+getPmpReq = do
   v ← B.getWord8
   if v /= 0
-  then return $ PmpUnsuppReq PmpUnsuppVer
+  then return $ PmpUnsuppVerInReq v
   else do
     op ← B.getWord8
     if op == 0
@@ -114,7 +113,7 @@ parsePmpReq = do
     else if op > 2
          then if op >= 128
               then return PmpNotReq
-              else return $ PmpUnsuppReq $ PmpUnsuppOp op
+              else return $ PmpUnsuppOpInReq op BS.empty
          else do
            let p = if op == 1 then UDP else TCP
            void $ B.getWord16be
@@ -126,11 +125,11 @@ parsePmpReq = do
                                        , pmpReqPubPort  = pubPort
                                        , pmpReqTtl      = ttl }
 
-deserializePmpReq ∷ S.Get PmpParsedReq
-deserializePmpReq = do
+sgetPmpReq ∷ S.Get PmpDecodedReq
+sgetPmpReq = do
   v ← S.getWord8
   if v /= 0
-  then return $ PmpUnsuppReq PmpUnsuppVer
+  then return $ PmpUnsuppVerInReq v
   else do
     op ← S.getWord8
     if op == 0
@@ -138,7 +137,7 @@ deserializePmpReq = do
     else if op > 2
          then if op >= 128
               then return PmpNotReq
-              else return $ PmpUnsuppReq $ PmpUnsuppOp op
+              else return $ PmpUnsuppOpInReq op BS.empty
          else do
            let p = if op == 1 then UDP else TCP
            void $ S.getWord16be
@@ -150,11 +149,20 @@ deserializePmpReq = do
                                        , pmpReqPubPort  = pubPort
                                        , pmpReqTtl      = ttl }
 
-unsuppPmpReq ∷ ByteString → Maybe ByteString
-unsuppPmpReq bs
-  | BS.length bs >= 4, rest ← BS.drop 4 bs
-  = Just $ BS.pack [0, BS.index bs 1 .|. 0x80, 0, 5] <> rest
-  | otherwise = Nothing
+pmpMsgData ∷ ByteString → ByteString
+pmpMsgData = BS.drop 4
+{-# INLINE pmpMsgData #-}
+
+encodePmpReq ∷ PmpReq → ByteString
+encodePmpReq = S.encode
+{-# INLINE encodePmpReq #-}
+
+decodePmpReq ∷ ByteString → Either String PmpDecodedReq
+decodePmpReq i = case S.runGet sgetPmpReq i of
+  Left e                        → Left e
+  Right (PmpUnsuppOpInReq op _) → Right $ PmpUnsuppOpInReq op $ pmpMsgData i
+  Right r                       → Right r
+{-# INLINABLE decodePmpReq #-}
 
 data PmpResult = PmpSuccess
                | PmpNotAuthd
@@ -179,17 +187,20 @@ pmpR2C PmpNetFailure = 3
 pmpR2C PmpOutOfRes   = 4
 pmpR2C PmpFatal      = 0xFFFF
 
+data PmpUnsupp = PmpUnsuppVer | PmpUnsuppOp
+
 pmpC2R ∷ Word16 → Either PmpUnsupp PmpResult
 pmpC2R 0 = Right PmpSuccess
 pmpC2R 1 = Left PmpUnsuppVer
 pmpC2R 2 = Right PmpNotAuthd
 pmpC2R 3 = Right PmpNetFailure
 pmpC2R 4 = Right PmpOutOfRes
-pmpC2R 5 = Left (PmpUnsuppOp 0)
+pmpC2R 5 = Left PmpUnsuppOp
 pmpC2R _ = Right PmpFatal
 
 data PmpResp = PmpUnsuppVerResp { pmpRespTs ∷ Word32 }
-             | PmpUnsuppOpResp { pmpRespOp ∷ Word8 }
+             | PmpUnsuppOpResp { pmpRespOp   ∷ Word8
+                               , pmpRespData ∷ ByteString }
              | PmpPubAddrResp { pmpRespResult ∷ PmpResult
                               , pmpRespTs     ∷ Word32
                               , pmpRespAddr   ∷ IP4 }
@@ -204,75 +215,100 @@ data PmpResp = PmpUnsuppVerResp { pmpRespTs ∷ Word32 }
 instance Hashable PmpResp
 
 instance Binary PmpResp where
-  put (PmpUnsuppVerResp {..}) = do
-    B.putWord8 0
-    B.putWord8 0
-    B.putWord16be 1
-    B.put pmpRespTs
-  put (PmpUnsuppOpResp {..}) = do
-    B.putWord8 0
-    B.putWord8 $ pmpRespOp .|. 0x80
-    B.putWord16be 5
-  put (PmpPubAddrResp {..}) = do
-    B.putWord8 0
-    B.putWord8 128
-    B.putWord16be $ pmpR2C pmpRespResult
-    B.put pmpRespTs
-    B.put pmpRespAddr
-  put (PmpMapResp {..}) = do
-    B.putWord8 0
-    B.putWord8 $ if pmpRespProto == UDP then 129 else 130
-    B.putWord16be $ pmpR2C pmpRespResult
-    B.put pmpRespTs
-    B.put pmpRespPrivPort
-    B.put pmpRespPubPort
-    B.put pmpRespTtl
-  get = parsePmpResp >>= \case
-    PmpResp resp    → return resp
-    PmpUnsuppResp e → fail $ "NAT-PMP: " ++ print e
-    PmpNotResp      → fail $ "NAT-PMP: Not a response"
+  put = putPmpResp' PmpHaskell
+  get = getPmpResp' PmpHaskell >>= \case
+    PmpResp resp          → return resp
+    PmpUnsuppVerInResp {} → fail $ "NAT-PMP: Unsupported protocol version"
+    PmpUnsuppOpInResp {}  → fail $ "NAT-PMP: Unsupported operation"
+    PmpNotResp            → fail $ "NAT-PMP: Not a response"
 
 instance Serialize PmpResp where
-  put (PmpUnsuppVerResp {..}) = do
-    S.putWord8 0
-    S.putWord8 0
-    S.putWord16be 1
-    S.put pmpRespTs
-  put (PmpUnsuppOpResp {..}) = do
-    S.putWord8 0
-    S.putWord8 $ pmpRespOp .|. 0x80
-    S.putWord16be 5
-  put (PmpPubAddrResp {..}) = do
-    S.putWord8 0
-    S.putWord8 128
-    S.putWord16be $ pmpR2C pmpRespResult
-    S.put pmpRespTs
-    S.put pmpRespAddr
-  put (PmpMapResp {..}) = do
-    S.putWord8 0
-    S.putWord8 $ if pmpRespProto == UDP then 129 else 130
-    S.putWord16be $ pmpR2C pmpRespResult
-    S.put pmpRespTs
-    S.put pmpRespPrivPort
-    S.put pmpRespPubPort
-    S.put pmpRespTtl
-  get = deserializePmpResp >>= \case
-    PmpResp resp    → return resp
-    PmpUnsuppResp e → fail $ "NAT-PMP: " ++ print e
-    PmpNotResp      → fail $ "NAT-PMP: Not a response"
+  put = sputPmpResp' PmpHaskell 
+  get = sgetPmpResp' PmpHaskell >>= \case
+    PmpResp resp          → return resp
+    PmpUnsuppVerInResp {} → fail $ "NAT-PMP: Unsupported protocol version"
+    PmpUnsuppOpInResp {}  → fail $ "NAT-PMP: Unsupported operation"
+    PmpNotResp            → fail $ "NAT-PMP: Not a response"
 
-data PmpParsedResp = PmpResp PmpResp
-                   | PmpUnsuppResp PmpUnsupp
-                   | PmpNotResp
-                   deriving (Typeable, Generic, Show, Read, Eq)
+data PmpEnv = PmpHaskell | PmpProto deriving Eq
 
-instance Hashable PmpParsedResp
+putPmpResp' ∷ PmpEnv → PmpResp → B.Put
+putPmpResp' _ (PmpUnsuppVerResp {..}) = do
+  B.putWord8 0
+  B.putWord8 0
+  B.putWord16be 1
+  B.put pmpRespTs
+putPmpResp' env (PmpUnsuppOpResp {..}) = do
+  B.putWord8 0
+  B.putWord8 $ pmpRespOp .|. 0x80
+  B.putWord16be 5
+  case env of
+    PmpHaskell → B.put pmpRespData
+    PmpProto   → B.putByteString pmpRespData
+putPmpResp' _ (PmpPubAddrResp {..}) = do
+  B.putWord8 0
+  B.putWord8 128
+  B.putWord16be $ pmpR2C pmpRespResult
+  B.put pmpRespTs
+  B.put pmpRespAddr
+putPmpResp' _ (PmpMapResp {..}) = do
+  B.putWord8 0
+  B.putWord8 $ if pmpRespProto == UDP then 129 else 130
+  B.putWord16be $ pmpR2C pmpRespResult
+  B.put pmpRespTs
+  B.put pmpRespPrivPort
+  B.put pmpRespPubPort
+  B.put pmpRespTtl
 
-parsePmpResp ∷ B.Get PmpParsedResp
-parsePmpResp = do
+putPmpResp ∷ PmpResp → B.Put
+putPmpResp = putPmpResp' PmpProto
+{-# INLINE putPmpResp #-}
+
+sputPmpResp' ∷ PmpEnv → PmpResp → S.Put
+sputPmpResp' _ (PmpUnsuppVerResp {..}) = do
+  S.putWord8 0
+  S.putWord8 0
+  S.putWord16be 1
+  S.put pmpRespTs
+sputPmpResp' env (PmpUnsuppOpResp {..}) = do
+  S.putWord8 0
+  S.putWord8 $ pmpRespOp .|. 0x80
+  S.putWord16be 5
+  case env of
+    PmpHaskell → S.put pmpRespData
+    PmpProto   → S.putByteString pmpRespData
+sputPmpResp' _ (PmpPubAddrResp {..}) = do
+  S.putWord8 0
+  S.putWord8 128
+  S.putWord16be $ pmpR2C pmpRespResult
+  S.put pmpRespTs
+  S.put pmpRespAddr
+sputPmpResp' _ (PmpMapResp {..}) = do
+  S.putWord8 0
+  S.putWord8 $ if pmpRespProto == UDP then 129 else 130
+  S.putWord16be $ pmpR2C pmpRespResult
+  S.put pmpRespTs
+  S.put pmpRespPrivPort
+  S.put pmpRespPubPort
+  S.put pmpRespTtl
+
+sputPmpResp ∷ PmpResp → S.Put
+sputPmpResp = sputPmpResp' PmpProto
+{-# INLINE sputPmpResp #-}
+
+data PmpDecodedResp = PmpResp PmpResp
+                    | PmpUnsuppVerInResp {-# UNPACK #-} !Word8
+                    | PmpUnsuppOpInResp {-# UNPACK #-} !Word8
+                    | PmpNotResp
+                    deriving (Typeable, Generic, Show, Read, Eq)
+
+instance Hashable PmpDecodedResp
+
+getPmpResp' ∷ PmpEnv → B.Get PmpDecodedResp
+getPmpResp' env = do
   v ← B.getWord8
   if v /= 0
-  then return $ PmpUnsuppResp PmpUnsuppVer
+  then return $ PmpUnsuppVerInResp v
   else do
     op ← B.getWord8
     if op < 128
@@ -285,15 +321,21 @@ parsePmpResp = do
            _ → return PmpNotResp
     else if op > 130
          then fmap pmpC2R B.getWord16be >>= \case
-           Left (PmpUnsuppOp _) →
-             return $ PmpResp $ PmpUnsuppOpResp $ op .&. 0x7F
-           _ → return $ PmpUnsuppResp $ PmpUnsuppOp op
+           Left PmpUnsuppOp → do
+             d ← case env of
+               PmpHaskell → B.get
+               PmpProto   → return BS.empty
+             return $ PmpResp $ PmpUnsuppOpResp (op .&. 0x7F) d
+           _ → return $ PmpUnsuppOpInResp op
          else fmap pmpC2R B.getWord16be >>= \case
            Left PmpUnsuppVer → do
              ts ← B.get
              return $ PmpResp $ PmpUnsuppVerResp ts
-           Left (PmpUnsuppOp _) →
-             return $ PmpResp $ PmpUnsuppOpResp $ op .&. 0x7F
+           Left PmpUnsuppOp → do
+             d ← case env of
+               PmpHaskell → B.get
+               PmpProto   → return BS.empty
+             return $ PmpResp $ PmpUnsuppOpResp (op .&. 0x7F) d
            Right r | op == 128 → do
              ts   ← B.get
              addr ← B.get
@@ -313,11 +355,15 @@ parsePmpResp = do
                                            , pmpRespPubPort  = pubPort
                                            , pmpRespTtl      = ttl }
 
-deserializePmpResp ∷ S.Get PmpParsedResp
-deserializePmpResp = do
+getPmpResp ∷ B.Get PmpDecodedResp
+getPmpResp = getPmpResp' PmpProto
+{-# INLINE getPmpResp #-}
+
+sgetPmpResp' ∷ PmpEnv → S.Get PmpDecodedResp
+sgetPmpResp' env = do
   v ← S.getWord8
   if v /= 0
-  then return $ PmpUnsuppResp PmpUnsuppVer
+  then return $ PmpUnsuppVerInResp v
   else do
     op ← S.getWord8
     if op < 128
@@ -330,15 +376,21 @@ deserializePmpResp = do
            _ → return PmpNotResp
     else if op > 130
          then fmap pmpC2R S.getWord16be >>= \case
-           Left (PmpUnsuppOp _) →
-             return $ PmpResp $ PmpUnsuppOpResp $ op .&. 0x7F
-           _ → return $ PmpUnsuppResp $ PmpUnsuppOp op
+           Left PmpUnsuppOp → do
+             d ← case env of
+               PmpHaskell → S.get
+               PmpProto   → return BS.empty
+             return $ PmpResp $ PmpUnsuppOpResp (op .&. 0x7F) d
+           _ → return $ PmpUnsuppOpInResp op
          else fmap pmpC2R S.getWord16be >>= \case
            Left PmpUnsuppVer → do
              ts ← S.get
              return $ PmpResp $ PmpUnsuppVerResp ts
-           Left (PmpUnsuppOp _) →
-             return $ PmpResp $ PmpUnsuppOpResp $ op .&. 0x7F
+           Left PmpUnsuppOp → do
+             d ← case env of
+               PmpHaskell → S.get
+               PmpProto   → return BS.empty
+             return $ PmpResp $ PmpUnsuppOpResp (op .&. 0x7F) d
            Right r | op == 128 → do
              ts   ← S.get
              addr ← S.get
@@ -357,4 +409,19 @@ deserializePmpResp = do
                                            , pmpRespPrivPort = privPort
                                            , pmpRespPubPort  = pubPort
                                            , pmpRespTtl      = ttl }
+
+sgetPmpResp ∷ S.Get PmpDecodedResp
+sgetPmpResp = sgetPmpResp' PmpProto
+{-# INLINE sgetPmpResp #-}
+
+encodePmpResp ∷ PmpResp → ByteString
+encodePmpResp = S.runPut . sputPmpResp
+{-# INLINE encodePmpResp #-}
+
+decodePmpResp ∷ ByteString → Either String PmpDecodedResp
+decodePmpResp i = case S.runGet sgetPmpResp i of
+  Left e → Left e
+  Right (PmpResp (PmpUnsuppOpResp op _)) →
+    Right $ PmpResp $ PmpUnsuppOpResp op $ pmpMsgData i
+  Right r → Right r
 

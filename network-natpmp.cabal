@@ -46,7 +46,6 @@ Test-Suite tests
     test-framework-quickcheck2 >= 0.2,
     QuickCheck                 >= 2.4,
     bytestring,
-    cereal,
     network-ip,
     network-natpmp
   Hs-Source-Dirs: tests
